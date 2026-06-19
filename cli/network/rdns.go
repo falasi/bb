@@ -1,13 +1,15 @@
-// rdns: read "ip" or "ip:port" lines on stdin, emit "ip<TAB>port<TAB>domain" on stdout.
+// rdns: read "ip" or "ip:port" lines on stdin, emit "ip<TAB>ports<TAB>domain".
 //
 //	cat targets.txt | rdns
 //	some-scanner | rdns -c 64 -t 1s | grep example.com
 //	cat targets.txt | rdns | cut -f1,3
 //
-// Tab-separated so it drops straight into cut/awk/grep (use -F'\t' / cut so the
-// empty port field on portless lines stays put). Concurrent lookups, output
-// kept in input order, streamed line-by-line as results arrive. Diagnostics
-// (if any) go to stderr so the stdout pipe stays clean.
+// Lines sharing an IP are merged into one row with their ports comma-joined
+// (deduped, first-seen order), so each IP is looked up only once. Because of
+// the grouping, all of stdin is read before output begins; rows then stream in
+// first-seen order as lookups resolve. Output is tab-separated for cut/awk/grep
+// (use -F'\t' / cut so the empty port field on portless lines stays put).
+// Diagnostics (if any) go to stderr so the stdout pipe stays clean.
 package main
 
 import (
@@ -27,50 +29,65 @@ func main() {
 	header := flag.Bool("H", false, "emit a header row")
 	flag.Parse()
 
-	type job struct {
-		ch chan string // buffered(1); the worker sends the finished row here
+	// Read everything first, grouping ports by IP. Grouping means a row can't be
+	// emitted until stdin closes (a duplicate IP may appear on the last line).
+	type entry struct {
+		ports []string
+		seen  map[string]bool // dedupe repeated ports
 	}
-	sem := make(chan struct{}, *workers) // caps in-flight goroutines
-	jobs := make(chan job, *workers)     // preserves order for the writer
+	byIP := map[string]*entry{}
+	order := []string{} // IPs in first-seen order
 
-	// Producer: read stdin, fan out a bounded set of lookup goroutines.
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // tolerate long lines
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // tolerate long lines
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		ip, port := splitTarget(line)
+		e := byIP[ip]
+		if e == nil {
+			e = &entry{seen: map[string]bool{}}
+			byIP[ip] = e
+			order = append(order, ip)
+		}
+		if port != "" && !e.seen[port] {
+			e.seen[port] = true
+			e.ports = append(e.ports, port)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "rdns: read error:", err)
+	}
+
+	// One lookup per unique IP, bounded concurrency. Each worker drops its
+	// finished row into a buffered(1) channel so it never waits on the writer.
+	sem := make(chan struct{}, *workers)
+	rows := make([]chan string, len(order))
+	for i, ip := range order {
+		ch := make(chan string, 1)
+		rows[i] = ch
+		sem <- struct{}{}
+		go func(ip, ports string, ch chan string) {
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+			domain := ""
+			if names, err := net.DefaultResolver.LookupAddr(ctx, ip); err == nil && len(names) > 0 {
+				domain = strings.TrimSuffix(names[0], ".")
 			}
-			ch := make(chan string, 1)
-			jobs <- job{ch} // enqueue first so writer sees input order
-			sem <- struct{}{}
-			go func(line string, ch chan string) {
-				defer func() { <-sem }()
-				ip, port := splitTarget(line)
-				ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-				defer cancel()
-				domain := ""
-				if names, err := net.DefaultResolver.LookupAddr(ctx, ip); err == nil && len(names) > 0 {
-					domain = strings.TrimSuffix(names[0], ".")
-				}
-				ch <- row(ip, port, domain)
-			}(line, ch)
-		}
-		if err := sc.Err(); err != nil {
-			fmt.Fprintln(os.Stderr, "rdns: read error:", err)
-		}
-		close(jobs)
-	}()
-
-	// Writer: drain jobs in order. Writing straight to os.Stdout means each line
-	// hits the pipe immediately — output streams as results arrive, and nothing
-	// is stranded in a buffer if the process is interrupted.
-	if *header {
-		fmt.Fprintln(os.Stdout, "ip\tport\tdomain")
+			ch <- row(ip, ports, domain)
+		}(ip, strings.Join(byIP[ip].ports, ","), ch)
 	}
-	for j := range jobs {
-		fmt.Fprintln(os.Stdout, <-j.ch)
+
+	// Writer: drain in first-seen order, straight to stdout so rows stream as
+	// they resolve and nothing is stranded in a buffer on interrupt.
+	if *header {
+		fmt.Fprintln(os.Stdout, "ip\tports\tdomain")
+	}
+	for _, ch := range rows {
+		fmt.Fprintln(os.Stdout, <-ch)
 	}
 }
 

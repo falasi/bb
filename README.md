@@ -1,3 +1,3 @@
 # Nothing to see here
 
-[!img](GB-MEME-2-home.jpg)
+![Nothing to see here](GB-MEME-2-home.jpg)
